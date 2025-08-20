@@ -1,7 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import sensor, binary_sensor, ble_client, time
-
+from esphome.components import sensor, ble_client, time
 from esphome.const import (
     STATE_CLASS_MEASUREMENT,
     UNIT_KILOGRAM,
@@ -19,6 +18,7 @@ from esphome.const import (
     ICON_TIMELAPSE,
     DEVICE_CLASS_WEIGHT,
 )
+from . import MedisanaScaleHub, CONF_MEDISANA_SCALE_HUB_ID
 
 UNIT_KILOCALORIERS="kcal"
 
