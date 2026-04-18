@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Callable
 
@@ -19,6 +19,7 @@ from homeassistant.components.bluetooth import (
     async_register_callback,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -120,15 +121,25 @@ def _decode_body(data: bytes, use_offset: bool) -> tuple[bool, int, int, int, fl
 class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
     def __init__(self, hass: HomeAssistant, address: str, use_timeoffset: bool) -> None:
         super().__init__(hass, _LOGGER, name=DOMAIN)
-        self.address       = address.upper()
+        self.address        = address.upper()
         self.use_timeoffset = use_timeoffset
         self._measurements: dict[int, UserMeasurement] = {
             uid: UserMeasurement() for uid in range(1, NUM_USERS + 1)
         }
         self._cancel_callback: Callable | None = None
         self._connecting = False
+        self._store = Store(hass, 1, f"{DOMAIN}.{address.replace(':', '_')}")
 
     async def async_start(self) -> None:
+        stored = await self._store.async_load()
+        if stored:
+            for uid_str, data in stored.items():
+                uid = int(uid_str)
+                if uid in self._measurements:
+                    self._measurements[uid] = UserMeasurement(**data)
+            self.async_set_updated_data(dict(self._measurements))
+            _LOGGER.debug("Restored measurements from storage")
+
         self._cancel_callback = async_register_callback(
             self.hass,
             self._on_ble_advertisement,
@@ -266,6 +277,9 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
             _LOGGER.info("Measurement user %d: weight=%.2f kg", pid, meas.weight or 0.0)
 
         self.async_set_updated_data(dict(self._measurements))
+        await self._store.async_save(
+            {str(uid): asdict(meas) for uid, meas in self._measurements.items()}
+        )
 
     def get_measurement(self, user_id: int) -> UserMeasurement:
         return self._measurements.get(user_id, UserMeasurement())
