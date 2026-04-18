@@ -1,7 +1,7 @@
 {
   "domain": "medisana_bs444",
   "name": "Medisana BS444",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "documentation": "https://github.com/Tuxdiver/weegschaal",
   "dependencies": ["bluetooth"],
   "requirements": ["bleak-retry-connector>=3.0.0"],
