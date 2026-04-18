@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Medisana BS444",
+        "description": "Enter the MAC address of your scale. Enable 'Time Offset' for BS410 and BS444 models.",
+        "data": {
+          "mac_address": "MAC Address",
+          "time_offset": "Time Offset (BS410/BS444)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Device is already configured."
+    }
+  }
+}

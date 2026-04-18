@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Medisana BS444",
+        "description": "MAC-Adresse der Waage eingeben. 'Zeitversatz' bei BS410 und BS444 aktivieren.",
+        "data": {
+          "mac_address": "MAC-Adresse",
+          "time_offset": "Zeitversatz (BS410/BS444)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Gerät ist bereits konfiguriert."
+    }
+  }
+}
