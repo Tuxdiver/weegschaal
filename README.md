@@ -47,17 +47,16 @@ without interference.
 
 ## Installation
 
-### Manual
+1. Clone this repository directly into your HA `config/custom_components/medisana_bs444/` directory:
 
-1. Copy the `medisana_bs444` folder into your HA `config/custom_components/` directory.
+   ```bash
+   cd /config/custom_components
+   git clone -b ha-integration https://github.com/Tuxdiver/weegschaal.git medisana_bs444
+   ```
+
+   Or download the files and copy them into `config/custom_components/medisana_bs444/`.
 2. Restart Home Assistant.
 3. Go to **Settings → Integrations → Add Integration** and search for **Medisana BS444**.
-
-### HACS (Custom Repository)
-
-1. In HACS, add this repository as a custom repository (Integration category).
-2. Install **Medisana BS444**.
-3. Restart Home Assistant.
 
 ---
 
