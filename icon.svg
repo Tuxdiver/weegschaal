@@ -1,50 +1,49 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-  <!-- Scale platform: flat, technical outline -->
-  <rect x="20" y="148" width="216" height="76" rx="12" fill="#1976D2"/>
-  <rect x="20" y="136" width="216" height="24" rx="8" fill="#2196F3"/>
+  <!-- White border frame -->
+  <rect x="4" y="4" width="248" height="248" rx="28" fill="#E0E0E0"/>
 
-  <!-- Display area: dark inset -->
-  <rect x="52" y="157" width="152" height="54" rx="6" fill="#0A1628"/>
+  <!-- Black glass body -->
+  <rect x="10" y="10" width="236" height="236" rx="24" fill="#111111"/>
 
-  <!-- Seven-segment style weight readout -->
-  <!-- "7 5 . 0" rendered as simple bold mono text -->
+  <!-- Subtle glass gloss top-left reflection -->
+  <ellipse cx="80" cy="60" rx="52" ry="24" fill="#ffffff" opacity="0.04" transform="rotate(-20 80 60)"/>
+
+  <!-- Left electrode strip (silver brushed) -->
+  <rect x="36" y="72" width="38" height="164" rx="8" fill="#8A8A8A"/>
+  <rect x="38" y="72" width="10" height="164" rx="6" fill="#AAAAAA" opacity="0.5"/>
+
+  <!-- Right electrode strip (silver brushed) -->
+  <rect x="182" y="72" width="38" height="164" rx="8" fill="#8A8A8A"/>
+  <rect x="184" y="72" width="10" height="164" rx="6" fill="#AAAAAA" opacity="0.5"/>
+
+  <!-- LCD display bezel -->
+  <rect x="84" y="28" width="88" height="60" rx="6" fill="#222222"/>
+
+  <!-- LCD screen -->
+  <rect x="88" y="32" width="80" height="52" rx="4" fill="#B8C8A8"/>
+
+  <!-- LCD weight readout (seven-segment style) -->
   <text
-    x="128" y="199"
+    x="128" y="71"
     text-anchor="middle"
     font-family="'Courier New', Courier, monospace"
-    font-size="40"
+    font-size="30"
     font-weight="bold"
-    fill="#29B6F6"
-    letter-spacing="3">75.0</text>
+    fill="#1A1A1A"
+    letter-spacing="1">64.2</text>
 
-  <!-- Unit -->
+  <!-- "kg" -->
   <text
-    x="197" y="207"
+    x="160" y="76"
     font-family="Arial, sans-serif"
-    font-size="14"
-    fill="#0288D1">kg</text>
+    font-size="11"
+    font-weight="bold"
+    fill="#1A1A1A">kg</text>
 
-  <!-- Bluetooth mark: simple geometric B-shape in top-right of display -->
-  <g transform="translate(174, 161)" stroke="#0288D1" stroke-width="2" stroke-linecap="round" fill="none">
-    <line x1="6" y1="2"  x2="6"  y2="22"/>
-    <polyline points="6,2 13,7 6,12"/>
-    <polyline points="6,12 13,17 6,22"/>
+  <!-- Bluetooth mark in display top-right -->
+  <g transform="translate(154,36)" stroke="#1A1A1A" stroke-width="1.8" stroke-linecap="round" fill="none">
+    <line x1="5" y1="2"  x2="5"  y2="16"/>
+    <polyline points="5,2  10,6  5,9"/>
+    <polyline points="5,9  10,13 5,16"/>
   </g>
-
-  <!-- Signal arcs (BLE broadcast) emanating upward from scale -->
-  <g stroke="#1976D2" stroke-linecap="round" fill="none">
-    <path d="M128 120 A16 16 0 0 1 144 104" stroke-width="4" opacity="0.5"/>
-    <path d="M128 120 A16 16 0 0 0 112 104" stroke-width="4" opacity="0.5"/>
-    <path d="M128 108 A28 28 0 0 1 156  80" stroke-width="3.5" opacity="0.35"/>
-    <path d="M128 108 A28 28 0 0 0 100  80" stroke-width="3.5" opacity="0.35"/>
-    <path d="M128  96 A42 42 0 0 1 170  54" stroke-width="3" opacity="0.2"/>
-    <path d="M128  96 A42 42 0 0 0  86  54" stroke-width="3" opacity="0.2"/>
-  </g>
-
-  <!-- Anchor dot for signal arcs -->
-  <circle cx="128" cy="124" r="4" fill="#1976D2" opacity="0.7"/>
-
-  <!-- Feet -->
-  <rect x="44"  y="220" width="36" height="10" rx="5" fill="#0D47A1"/>
-  <rect x="176" y="220" width="36" height="10" rx="5" fill="#0D47A1"/>
 </svg>
