@@ -9,7 +9,6 @@ from datetime import datetime
 from typing import Callable
 
 from bleak import BleakClient
-from bleak_retry_connector import establish_connection
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import (
@@ -283,14 +282,12 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
                     _LOGGER.debug("Body %d: kcal=%d fat=%.1f%%", pid, kcal, fat)
             _touch()
 
+        client = BleakClient(device, disconnected_callback=lambda _: done.set())
         try:
-            client = await establish_connection(
-                BleakClient,
-                device,
-                self.address,
-                disconnected_callback=lambda _: done.set(),
-                max_attempts=3,
-            )
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Connection to scale timed out")
+            return False
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("Could not connect to scale: %s", exc)
             return False
