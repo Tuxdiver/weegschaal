@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Callable
@@ -38,6 +39,9 @@ _LOGGER = logging.getLogger(__name__)
 _IDLE_TIMEOUT = 5.0
 # Hard cap for the entire session
 _SESSION_TIMEOUT = 60.0
+# Ignore BLE advertisements for this long after a session ends (prevents
+# spurious re-triggers from the post-disconnect re-advertisement burst)
+_SESSION_COOLDOWN = 30.0
 
 
 @dataclass
@@ -128,6 +132,7 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
         }
         self._cancel_callback: Callable | None = None
         self._connecting = False
+        self._last_session_end: float = -_SESSION_COOLDOWN  # allow immediate first trigger
         self._store = Store(hass, 1, f"{DOMAIN}.{address.replace(':', '_')}")
 
     async def async_start(self) -> None:
@@ -161,6 +166,8 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
     ) -> None:
         if self._connecting:
             return
+        if time.monotonic() - self._last_session_end < _SESSION_COOLDOWN:
+            return
         self._connecting = True
         self.hass.async_create_task(self._async_run_session())
 
@@ -175,6 +182,7 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
             _LOGGER.error("BLE session failed: %s", exc)
         finally:
             self._connecting = False
+            self._last_session_end = time.monotonic()
 
     async def _async_do_session(self, device) -> None:
         _LOGGER.debug("Starting session with %s", self.address)
