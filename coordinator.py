@@ -168,15 +168,13 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
             return
         if time.monotonic() - self._last_session_end < _SESSION_COOLDOWN:
             return
+        if not service_info.connectable:
+            return
         self._connecting = True
-        self.hass.async_create_task(self._async_run_session())
+        self.hass.async_create_task(self._async_run_session(service_info.device))
 
-    async def _async_run_session(self) -> None:
+    async def _async_run_session(self, device) -> None:
         try:
-            device = async_ble_device_from_address(self.hass, self.address, connectable=True)
-            if device is None:
-                _LOGGER.debug("Scale not reachable via connectable proxy, skipping")
-                return
             connected = await self._async_do_session(device)
             if connected:
                 # Only apply cooldown after a real connection — prevents spurious
