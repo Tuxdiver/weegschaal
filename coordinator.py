@@ -165,23 +165,68 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange,
     ) -> None:
+        now = time.monotonic()
+        cooldown_remaining = _SESSION_COOLDOWN - (now - self._last_session_end)
+
+        is_active = (
+            SERVICE_UUID_ACTIVE in service_info.service_uuids
+            or bool(service_info.manufacturer_data)
+        )
+
+        _LOGGER.debug(
+            "BLE advertisement: connectable=%s active=%s connecting=%s cooldown=%.1fs",
+            service_info.connectable,
+            is_active,
+            self._connecting,
+            max(0.0, cooldown_remaining),
+        )
+
         if self._connecting:
             return
-        if time.monotonic() - self._last_session_end < _SESSION_COOLDOWN:
+        if cooldown_remaining > 0:
+            if is_active and service_info.connectable:
+                # Active advertisement seen during cooldown — schedule a deferred
+                # connect attempt so we don't miss the weighing session if HA
+                # doesn't re-deliver this advertisement after the cooldown expires.
+                self.hass.async_create_task(
+                    self._async_deferred_session(service_info.device, cooldown_remaining)
+                )
             return
         if not service_info.connectable:
             return
         # Only connect when scale is active — standby advertisements have only
         # one service UUID and no manufacturer data; active weighing mode has both.
-        is_active = (
-            SERVICE_UUID_ACTIVE in service_info.service_uuids
-            or bool(service_info.manufacturer_data)
-        )
         if not is_active:
             _LOGGER.debug("Scale in standby mode, skipping")
             return
         self._connecting = True
         self.hass.async_create_task(self._async_run_session(service_info.device))
+
+    async def _async_deferred_session(self, device, delay: float) -> None:
+        """Wait out the cooldown, then attempt a session with the cached device.
+
+        This handles the case where an active-mode advertisement arrives while the
+        cooldown is still active.  HA may not re-deliver the same advertisement
+        once the cooldown expires, so we schedule the connect ourselves.
+        """
+        _LOGGER.debug("Deferred session: waiting %.1fs for cooldown", delay)
+        await asyncio.sleep(delay + 0.5)  # small extra margin
+        if self._connecting:
+            _LOGGER.debug("Deferred session: already connecting, bailing")
+            return
+        now = time.monotonic()
+        if now - self._last_session_end < _SESSION_COOLDOWN:
+            _LOGGER.debug("Deferred session: cooldown still active after sleep, bailing")
+            return
+        # Prefer a fresh device handle if the proxy has seen a newer advertisement
+        fresh = async_ble_device_from_address(self.hass, self.address, connectable=True)
+        target = fresh or device
+        if target is None:
+            _LOGGER.debug("Deferred session: no connectable device found")
+            return
+        _LOGGER.debug("Deferred session: starting BLE session")
+        self._connecting = True
+        await self._async_run_session(target)
 
     async def _async_run_session(self, device) -> None:
         try:
