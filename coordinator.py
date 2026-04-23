@@ -30,6 +30,7 @@ from .const import (
     CHAR_WEIGHT,
     DOMAIN,
     NUM_USERS,
+    SERVICE_UUID_ACTIVE,
     TIME_OFFSET,
 )
 
@@ -169,6 +170,15 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
         if time.monotonic() - self._last_session_end < _SESSION_COOLDOWN:
             return
         if not service_info.connectable:
+            return
+        # Only connect when scale is active — standby advertisements have only
+        # one service UUID and no manufacturer data; active weighing mode has both.
+        is_active = (
+            SERVICE_UUID_ACTIVE in service_info.service_uuids
+            or bool(service_info.manufacturer_data)
+        )
+        if not is_active:
+            _LOGGER.debug("Scale in standby mode, skipping")
             return
         self._connecting = True
         self.hass.async_create_task(self._async_run_session(service_info.device))
