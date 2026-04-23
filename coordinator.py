@@ -177,14 +177,20 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
             if device is None:
                 _LOGGER.debug("Scale not reachable via connectable proxy, skipping")
                 return
-            await self._async_do_session(device)
+            connected = await self._async_do_session(device)
+            if connected:
+                # Only apply cooldown after a real connection — prevents spurious
+                # re-triggers from the post-disconnect advertisement burst.
+                # After a failed connect attempt there is no such burst, so we
+                # must NOT block the next advertisement.
+                self._last_session_end = time.monotonic()
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("BLE session failed: %s", exc)
         finally:
             self._connecting = False
-            self._last_session_end = time.monotonic()
 
-    async def _async_do_session(self, device) -> None:
+    async def _async_do_session(self, device) -> bool:
+        """Run one BLE session. Returns True if a connection was established."""
         _LOGGER.debug("Starting session with %s", self.address)
 
         # Per-session buffers — keep only the newest entry per person
@@ -224,12 +230,18 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
                     _LOGGER.debug("Body %d: kcal=%d fat=%.1f%%", pid, kcal, fat)
             _touch()
 
-        client = await establish_connection(
-            BleakClient,
-            device,
-            self.address,
-            disconnected_callback=lambda _: done.set(),
-        )
+        try:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.address,
+                disconnected_callback=lambda _: done.set(),
+                max_attempts=3,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Could not connect to scale: %s", exc)
+            return False
+
         try:
             await client.start_notify(CHAR_PERSON, on_person)
             await client.start_notify(CHAR_WEIGHT, on_weight)
@@ -289,6 +301,7 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
         await self._store.async_save(
             {str(uid): asdict(meas) for uid, meas in self._measurements.items()}
         )
+        return True
 
     def get_measurement(self, user_id: int) -> UserMeasurement:
         return self._measurements.get(user_id, UserMeasurement())
