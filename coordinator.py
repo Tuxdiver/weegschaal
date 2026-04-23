@@ -295,6 +295,10 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
             _LOGGER.warning("Could not connect to scale: %s", exc)
             return False
 
+        if done.is_set():
+            _LOGGER.warning("Scale disconnected before GATT setup (proxy too slow?)")
+            return False
+
         try:
             await client.start_notify(CHAR_PERSON, on_person)
             await client.start_notify(CHAR_WEIGHT, on_weight)
