@@ -36,7 +36,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # How long to wait after the last BLE packet before giving up
-_IDLE_TIMEOUT = 5.0
+_IDLE_TIMEOUT = 15.0
 # Hard cap for the entire session
 _SESSION_TIMEOUT = 60.0
 # Ignore BLE advertisements for this long after a session ends (prevents
@@ -240,6 +240,7 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
                 ts_cmd -= TIME_OFFSET
             cmd = bytes([0x02]) + struct.pack("<I", ts_cmd)
             await client.write_gatt_char(CHAR_COMMAND, cmd, response=True)
+            last_packet[0] = now_ts()  # start idle timer only after command is sent
             _LOGGER.debug("Command sent (ts=%d), waiting for data…", ts_cmd)
 
             # Wait until the scale disconnects itself, or we time out
