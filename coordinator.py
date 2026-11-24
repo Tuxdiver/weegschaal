@@ -4,21 +4,23 @@ import asyncio
 import logging
 import struct
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from typing import Callable
 
-from bleak import BleakClient
+from bleak.backends.device import BLEDevice
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
-from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import (
     BluetoothChange,
     BluetoothScanningMode,
     BluetoothServiceInfoBleak,
     async_ble_device_from_address,
+    async_last_service_info,
     async_register_callback,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
@@ -29,19 +31,30 @@ from .const import (
     CHAR_WEIGHT,
     DOMAIN,
     NUM_USERS,
-    SERVICE_UUID_ACTIVE,
     TIME_OFFSET,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+# How often we look at HA's advertisement history for the scale. HA only
+# dispatches bluetooth callbacks when the advertisement *content* changes, and
+# the scale always sends the same advertisement, so after the first weighing
+# the callback never fires again. The advertisement time in the history is
+# updated on every packet though, so we poll that.
+_POLL_INTERVAL = timedelta(seconds=2)
+# Advertisements older than this are considered stale (e.g. restored history
+# after a HA restart) and never trigger a connection.
+_MAX_ADV_AGE = 10.0
 # How long to wait after the last BLE packet before giving up
 _IDLE_TIMEOUT = 15.0
 # Hard cap for the entire session
 _SESSION_TIMEOUT = 60.0
-# Ignore BLE advertisements for this long after a session ends (prevents
-# spurious re-triggers from the post-disconnect re-advertisement burst)
+# Ignore advertisements for this long after a successful session (the scale
+# keeps advertising for a while after it disconnects)
 _SESSION_COOLDOWN = 30.0
+# Backoff after failed connection attempts (doubles per failure, capped)
+_RETRY_BACKOFF = 5.0
+_RETRY_BACKOFF_MAX = 60.0
 
 
 @dataclass
@@ -66,6 +79,9 @@ class UserMeasurement:
 # ---------------------------------------------------------------------------
 # Packet decoders (ported 1-to-1 from Scale.cpp)
 # ---------------------------------------------------------------------------
+
+_LB_TO_KG = 0.45359237
+
 
 def _sanitize_ts(raw: int, use_offset: bool) -> int:
     if use_offset:
@@ -94,9 +110,12 @@ def _decode_person(data: bytes) -> tuple[bool, int, bool, int, int, bool]:
 
 def _decode_weight(data: bytes, use_offset: bool) -> tuple[bool, int, float, int]:
     """Return (valid, person_id, weight_kg, timestamp)."""
-    if len(data) < 14 or data[0] != 0x1D:
+    if len(data) < 14 or data[0] not in (0x1D, 0x3D):
         return False, 0, 0.0, 0
     weight_kg  = struct.unpack_from("<H", data, 1)[0] / 100.0
+    if data[0] == 0x3D:
+        # scale is set to lb
+        weight_kg *= _LB_TO_KG
     raw_ts     = struct.unpack_from("<I", data, 5)[0]
     timestamp  = _sanitize_ts(raw_ts, use_offset)
     person_id  = data[13]
@@ -130,9 +149,13 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
         self._measurements: dict[int, UserMeasurement] = {
             uid: UserMeasurement() for uid in range(1, NUM_USERS + 1)
         }
-        self._cancel_callback: Callable | None = None
-        self._connecting = False
-        self._last_session_end: float = -_SESSION_COOLDOWN  # allow immediate first trigger
+        self._unsub: list[Callable[[], None]] = []
+        self._session_task: asyncio.Task | None = None
+        # Monotonic time of the last advertisement we have looked at
+        self._last_adv_time: float = 0.0
+        # Advertisements before this monotonic time are ignored
+        self._ignore_until: float = 0.0
+        self._failures = 0
         self._store = Store(hass, 1, f"{DOMAIN}.{address.replace(':', '_')}")
 
     async def async_start(self) -> None:
@@ -145,18 +168,33 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
             self.async_set_updated_data(dict(self._measurements))
             _LOGGER.debug("Restored measurements from storage")
 
-        self._cancel_callback = async_register_callback(
-            self.hass,
-            self._on_ble_advertisement,
-            {"address": self.address},
-            BluetoothScanningMode.ACTIVE,
+        # Change-driven callback: fires on the first advertisement after the
+        # scale was unavailable and whenever the advertisement content changes.
+        self._unsub.append(
+            async_register_callback(
+                self.hass,
+                self._on_ble_advertisement,
+                {"address": self.address, "connectable": True},
+                BluetoothScanningMode.ACTIVE,
+            )
         )
-        _LOGGER.debug("Registered BLE callback for %s", self.address)
+        # Poll the advertisement history to catch repeated identical
+        # advertisements, which HA does not dispatch to callbacks.
+        self._unsub.append(
+            async_track_time_interval(self.hass, self._async_poll, _POLL_INTERVAL)
+        )
+        _LOGGER.debug("Watching BLE advertisements of %s", self.address)
 
     async def async_stop(self) -> None:
-        if self._cancel_callback:
-            self._cancel_callback()
-            self._cancel_callback = None
+        while self._unsub:
+            self._unsub.pop()()
+        if self._session_task and not self._session_task.done():
+            self._session_task.cancel()
+            try:
+                await self._session_task
+            except asyncio.CancelledError:
+                pass
+        self._session_task = None
 
     @callback
     def _on_ble_advertisement(
@@ -164,84 +202,71 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange,
     ) -> None:
+        self._handle_advertisement(service_info)
+
+    @callback
+    def _async_poll(self, _now: datetime) -> None:
+        service_info = async_last_service_info(self.hass, self.address, connectable=True)
+        if service_info is not None:
+            self._handle_advertisement(service_info)
+
+    @callback
+    def _handle_advertisement(self, service_info: BluetoothServiceInfoBleak) -> None:
+        adv_time = service_info.time
+        if adv_time <= self._last_adv_time:
+            return  # already seen
+        self._last_adv_time = adv_time
+
         now = time.monotonic()
-        cooldown_remaining = _SESSION_COOLDOWN - (now - self._last_session_end)
-
-        is_active = (
-            SERVICE_UUID_ACTIVE in service_info.service_uuids
-            or bool(service_info.manufacturer_data)
-        )
-
+        age = now - adv_time
         _LOGGER.debug(
-            "BLE advertisement: connectable=%s active=%s connecting=%s cooldown=%.1fs",
+            "BLE advertisement: connectable=%s age=%.1fs rssi=%s busy=%s ignore=%.1fs",
             service_info.connectable,
-            is_active,
-            self._connecting,
-            max(0.0, cooldown_remaining),
+            age,
+            service_info.rssi,
+            self._session_task is not None,
+            max(0.0, self._ignore_until - now),
         )
 
-        if self._connecting:
-            return
-        if cooldown_remaining > 0:
-            if is_active and service_info.connectable:
-                # Active advertisement seen during cooldown — schedule a deferred
-                # connect attempt so we don't miss the weighing session if HA
-                # doesn't re-deliver this advertisement after the cooldown expires.
-                self.hass.async_create_task(
-                    self._async_deferred_session(service_info.device, cooldown_remaining)
-                )
+        if self._session_task is not None:
             return
         if not service_info.connectable:
             return
-        # Only connect when scale is active — standby advertisements have only
-        # one service UUID and no manufacturer data; active weighing mode has both.
-        if not is_active:
-            _LOGGER.debug("Scale in standby mode, skipping")
+        if age > _MAX_ADV_AGE:
+            # e.g. history restored after a restart; the scale is not awake
             return
-        self._connecting = True
-        self.hass.async_create_task(self._async_run_session(service_info.device))
+        if adv_time < self._ignore_until:
+            return
 
-    async def _async_deferred_session(self, device, delay: float) -> None:
-        """Wait out the cooldown, then attempt a session with the cached device.
+        # The scale only advertises while it is awake (right after someone
+        # stepped on it), so any fresh connectable advertisement means
+        # "connect now" - just like the ESPHome ble_client does.
+        self._session_task = self.hass.async_create_background_task(
+            self._async_run_session(service_info.device),
+            f"{DOMAIN}_{self.address}_session",
+        )
 
-        This handles the case where an active-mode advertisement arrives while the
-        cooldown is still active.  HA may not re-deliver the same advertisement
-        once the cooldown expires, so we schedule the connect ourselves.
-        """
-        _LOGGER.debug("Deferred session: waiting %.1fs for cooldown", delay)
-        await asyncio.sleep(delay + 0.5)  # small extra margin
-        if self._connecting:
-            _LOGGER.debug("Deferred session: already connecting, bailing")
-            return
-        now = time.monotonic()
-        if now - self._last_session_end < _SESSION_COOLDOWN:
-            _LOGGER.debug("Deferred session: cooldown still active after sleep, bailing")
-            return
-        # Prefer a fresh device handle if the proxy has seen a newer advertisement
-        fresh = async_ble_device_from_address(self.hass, self.address, connectable=True)
-        target = fresh or device
-        if target is None:
-            _LOGGER.debug("Deferred session: no connectable device found")
-            return
-        _LOGGER.debug("Deferred session: starting BLE session")
-        self._connecting = True
-        await self._async_run_session(target)
-
-    async def _async_run_session(self, device) -> None:
+    async def _async_run_session(self, device: BLEDevice) -> None:
+        connected = False
         try:
             connected = await self._async_do_session(device)
-            if connected:
-                # Only apply cooldown after a real connection — prevents spurious
-                # re-triggers from the post-disconnect advertisement burst.
-                # After a failed connect attempt there is no such burst, so we
-                # must NOT block the next advertisement.
-                self._last_session_end = time.monotonic()
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.error("BLE session failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("BLE session with %s failed", self.address)
         finally:
-            self._connecting = False
+            # After a real session the scale keeps advertising for a while;
+            # don't reconnect for that. After a failed attempt retry soon.
+            if connected:
+                self._failures = 0
+                delay = _SESSION_COOLDOWN
+            else:
+                delay = min(_RETRY_BACKOFF * 2 ** self._failures, _RETRY_BACKOFF_MAX)
+                self._failures += 1
+            self._ignore_until = time.monotonic() + delay
+            self._session_task = None
 
-    async def _async_do_session(self, device) -> bool:
+    async def _async_do_session(self, device: BLEDevice) -> bool:
         """Run one BLE session. Returns True if a connection was established."""
         _LOGGER.debug("Starting session with %s", self.address)
 
@@ -250,12 +275,12 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
         weight_data:  dict[int, tuple] = {}   # pid -> (weight_kg, timestamp)
         body_data:    dict[int, tuple] = {}   # pid -> (timestamp, kcal, fat, tbw, muscle, bone)
 
-        now_ts = asyncio.get_event_loop().time
-        last_packet: list[float] = [now_ts()]
+        loop = asyncio.get_running_loop()
+        last_packet: list[float] = [loop.time()]
         done = asyncio.Event()
 
         def _touch() -> None:
-            last_packet[0] = now_ts()
+            last_packet[0] = loop.time()
 
         def on_person(_, data: bytearray) -> None:
             ok, pid, male, age, size_cm, high_act = _decode_person(bytes(data))
@@ -266,7 +291,7 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
 
         def on_weight(_, data: bytearray) -> None:
             ok, pid, weight_kg, ts = _decode_weight(bytes(data), self.use_timeoffset)
-            if ok and 1 <= pid <= NUM_USERS and ts <= int(datetime.now().timestamp()):
+            if ok and 1 <= pid <= NUM_USERS and ts <= int(time.time()):
                 existing = weight_data.get(pid)
                 if existing is None or ts > existing[1]:
                     weight_data[pid] = (weight_kg, ts)
@@ -275,68 +300,103 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
 
         def on_body(_, data: bytearray) -> None:
             ok, pid, ts, kcal, fat, tbw, muscle, bone = _decode_body(bytes(data), self.use_timeoffset)
-            if ok and 1 <= pid <= NUM_USERS and ts <= int(datetime.now().timestamp()):
+            if ok and 1 <= pid <= NUM_USERS and ts <= int(time.time()):
                 existing = body_data.get(pid)
                 if existing is None or ts > existing[0]:
                     body_data[pid] = (ts, kcal, fat, tbw, muscle, bone)
                     _LOGGER.debug("Body %d: kcal=%d fat=%.1f%%", pid, kcal, fat)
             _touch()
 
-        client = BleakClient(device, disconnected_callback=lambda _: done.set())
+        def _fresh_device() -> BLEDevice:
+            return (
+                async_ble_device_from_address(self.hass, self.address, connectable=True)
+                or device
+            )
+
         try:
-            await asyncio.wait_for(client.connect(), timeout=10.0)
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Connection to scale timed out")
-            return False
+            client = await establish_connection(
+                BleakClientWithServiceCache,
+                device,
+                f"Medisana BS444 ({self.address})",
+                disconnected_callback=lambda _: done.set(),
+                max_attempts=3,
+                ble_device_callback=_fresh_device,
+            )
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Could not connect to scale: %s", exc)
-            return False
-
-        if done.is_set():
-            _LOGGER.warning("Scale disconnected before GATT setup (proxy too slow?)")
+            _LOGGER.debug("Could not connect to scale: %s", exc)
             return False
 
         try:
+            if done.is_set() or not client.is_connected:
+                _LOGGER.warning("Scale disconnected before GATT setup (proxy too slow?)")
+                return False
+
             await client.start_notify(CHAR_PERSON, on_person)
             await client.start_notify(CHAR_WEIGHT, on_weight)
             await client.start_notify(CHAR_BODY, on_body)
 
-            ts_cmd = int(datetime.now().timestamp())
+            ts_cmd = int(time.time())
             if self.use_timeoffset:
                 ts_cmd -= TIME_OFFSET
             cmd = bytes([0x02]) + struct.pack("<I", ts_cmd)
             await client.write_gatt_char(CHAR_COMMAND, cmd, response=True)
-            last_packet[0] = now_ts()  # start idle timer only after command is sent
+            _touch()  # start idle timer only after command is sent
             _LOGGER.debug("Command sent (ts=%d), waiting for data…", ts_cmd)
 
             # Wait until the scale disconnects itself, or we time out
-            deadline = now_ts() + _SESSION_TIMEOUT
+            deadline = loop.time() + _SESSION_TIMEOUT
             while not done.is_set():
-                await asyncio.sleep(1.0)
-                if now_ts() - last_packet[0] > _IDLE_TIMEOUT:
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                if loop.time() - last_packet[0] > _IDLE_TIMEOUT:
                     _LOGGER.debug("No data for %.0fs, closing session", _IDLE_TIMEOUT)
                     break
-                if now_ts() > deadline:
+                if loop.time() > deadline:
                     _LOGGER.warning("Session timeout after %.0fs", _SESSION_TIMEOUT)
                     break
         finally:
-            if client.is_connected:
+            # Always release the proxy connection slot, even if the scale
+            # already dropped the link or the session was cancelled.
+            try:
                 await client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("Error while disconnecting: %s", exc)
 
-        # Publish measurements
-        for pid, (male, age, size_cm, high_act) in person_data.items():
-            meas = UserMeasurement(
-                age=age or None,
-                size_cm=size_cm or None,
-                male=male,
-                high_activity=high_act,
-            )
+        self._publish(person_data, weight_data, body_data)
+        await self._store.async_save(
+            {str(uid): asdict(meas) for uid, meas in self._measurements.items()}
+        )
+        return True
+
+    @callback
+    def _publish(
+        self,
+        person_data: dict[int, tuple],
+        weight_data: dict[int, tuple],
+        body_data: dict[int, tuple],
+    ) -> None:
+        if not (person_data or weight_data or body_data):
+            _LOGGER.debug("Session finished without data")
+            return
+
+        for pid in sorted(set(person_data) | set(weight_data) | set(body_data)):
+            old = self._measurements.get(pid, UserMeasurement())
+            meas = UserMeasurement(**asdict(old))
+
+            if pid in person_data:
+                male, age, size_cm, high_act = person_data[pid]
+                meas.age           = age or None
+                meas.size_cm       = size_cm or None
+                meas.male          = male
+                meas.high_activity = high_act
             if pid in weight_data:
                 w_kg, w_ts = weight_data[pid]
                 meas.weight    = round(w_kg, 2)
                 meas.timestamp = w_ts
-                if size_cm:
-                    size_m = size_cm / 100.0
+                if meas.size_cm:
+                    size_m = meas.size_cm / 100.0
                     meas.bmi = round(w_kg / (size_m ** 2), 1)
             if pid in body_data:
                 b_ts, kcal, fat, tbw, muscle, bone = body_data[pid]
@@ -345,17 +405,13 @@ class MedisanaCoordinator(DataUpdateCoordinator[dict[int, UserMeasurement]]):
                 meas.tbw    = tbw
                 meas.muscle = muscle
                 meas.bone   = bone
-                if meas.timestamp is None:
+                if pid not in weight_data:
                     meas.timestamp = b_ts
 
             self._measurements[pid] = meas
             _LOGGER.info("Measurement user %d: weight=%.2f kg", pid, meas.weight or 0.0)
 
         self.async_set_updated_data(dict(self._measurements))
-        await self._store.async_save(
-            {str(uid): asdict(meas) for uid, meas in self._measurements.items()}
-        )
-        return True
 
     def get_measurement(self, user_id: int) -> UserMeasurement:
         return self._measurements.get(user_id, UserMeasurement())
